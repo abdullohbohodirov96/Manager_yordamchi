@@ -2,7 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
 // ========== SOZLAMALAR ==========
-const TOKEN = '8818804444:AAHCZJoOyXIVBQX628nArXvL0QyZBZxhhZk';
+const TOKEN = process.env.BOT_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
 const SHEETS = {
