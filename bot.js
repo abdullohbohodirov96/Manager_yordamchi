@@ -19,7 +19,7 @@ const SHEETS = {
 };
 // ================================
 
-const bot = new TelegramBot(TOKEN, { polling: true });
+const bot = new TelegramBot(TOKEN, { polling: { interval: 300, autoStart: true, params: { timeout: 10 } } });
 
 // CSV parse
 function parseCSV(text) {
