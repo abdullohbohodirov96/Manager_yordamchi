@@ -1,231 +1,200 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
-// ========== SOZLAMALAR ==========
 const TOKEN = process.env.BOT_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
 const SHEETS = {
   zebo: {
     name: 'Zebo',
-    id: '1dEE5NipUffWAE0rzrF26bhKOKP4KTtE_LZlyhusy8yU',
-    csvUrl: 'https://docs.google.com/spreadsheets/d/1dEE5NipUffWAE0rzrF26bhKOKP4KTtE_LZlyhusy8yU/export?format=csv'
+    csvUrl: 'https://docs.google.com/spreadsheets/d/1dEE5NipUffWAE0rzrF26bhKOKP4KTtE_LZlyhusy8yU/export?format=csv&cachebust=' + Date.now()
   },
   noizma: {
     name: 'Noizma',
-    id: '17tPwSgr-jQKut2Gfznd7EsqW-0SVUBX3AdCZO6BdlnE',
-    csvUrl: 'https://docs.google.com/spreadsheets/d/17tPwSgr-jQKut2Gfznd7EsqW-0SVUBX3AdCZO6BdlnE/export?format=csv'
+    csvUrl: 'https://docs.google.com/spreadsheets/d/17tPwSgr-jQKut2Gfznd7EsqW-0SVUBX3AdCZO6BdlnE/export?format=csv&cachebust=' + Date.now()
   }
 };
-// ================================
 
-const bot = new TelegramBot(TOKEN, { polling: { interval: 300, autoStart: true, params: { timeout: 10 } } });
-
-// CSV parse
-function parseCSV(text) {
-  const lines = text.trim().split('\n');
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
-  return lines.slice(1).map(line => {
-    const values = line.split(',').map(v => v.trim().replace(/"/g, ''));
-    const row = {};
-    headers.forEach((h, i) => { row[h] = values[i] || ''; });
-    return row;
-  });
-}
-
-// Sheets o'qish
-async function fetchSheet(sheetKey) {
+// Oldin webhook va pending updatelarni tozalaymiz
+async function clearAndStart() {
   try {
-    const sheet = SHEETS[sheetKey];
-    const res = await axios.get(sheet.csvUrl, { timeout: 15000 });
-    const rows = parseCSV(res.data);
-    return rows.filter(r => r['Ismi'] || r['1-Tel nomer']);
-  } catch (e) {
-    return null;
+    await axios.get(`https://api.telegram.org/bot${TOKEN}/deleteWebhook?drop_pending_updates=true`);
+    console.log('Webhook tozalandi');
+    await new Promise(r => setTimeout(r, 2000));
+  } catch(e) {
+    console.log('Webhook tozalash xatosi:', e.message);
   }
-}
 
-// Ikkala sheet ham
-async function fetchAllSheets() {
-  const [zebo, noizma] = await Promise.all([
-    fetchSheet('zebo'),
-    fetchSheet('noizma')
-  ]);
-  return { zebo, noizma };
-}
-
-// Statistika hisoblash
-function calcStats(rows) {
-  if (!rows) return null;
-  const total = rows.length;
-  const boglan = rows.filter(r => r["Bog'lanldimi?"] === 'Haa').length;
-  const sifatli = rows.filter(r => r['Lead sifati'] === 'Sifatli').length;
-  const sifatsiz = rows.filter(r => r['Lead sifati'] === 'Sifatsiz').length;
-  const qaytaKerak = rows.filter(r => {
-    const v = r["Qayta aloqa\n keremi?"] || r["Qayta aloqa keremi?"] || '';
-    return v === 'Kerak';
-  }).length;
-  const telOlmadi = rows.filter(r => (r['Izoh'] || '').toLowerCase().includes('tel omadi')).length;
-  const qimmat = rows.filter(r => (r['Holati'] || '').toLowerCase().includes('qimmat')).length;
-  const products = {};
-  rows.forEach(r => {
-    const p = r["Qaysi mahsulotga qiziqdi"] || '';
-    if (p) {
-      const key = p.toLowerCase().includes('bazalt') && p.toLowerCase().includes('penoplex') ? 'bazalt+penoplex'
-        : p.toLowerCase().includes('bazalt') ? 'bazalt'
-        : p.toLowerCase().includes('penoplex') || p.toLowerCase().includes('pinoplex') ? 'penoplex'
-        : p.toLowerCase().includes('minvata') ? 'minvata' : p;
-      if (key) products[key] = (products[key] || 0) + 1;
+  const bot = new TelegramBot(TOKEN, {
+    polling: {
+      interval: 1000,
+      autoStart: true,
+      params: { timeout: 10, allowed_updates: ['message'] }
     }
   });
-  return { total, boglan, sifatli, sifatsiz, qaytaKerak, telOlmadi, qimmat, products };
-}
 
-// AI ga so'rov
-async function askClaude(systemPrompt, userMessage) {
-  try {
-    const res = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1500,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userMessage }]
-    }, {
-      headers: {
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
-      },
-      timeout: 30000
-    });
-    return res.data.content[0].text;
-  } catch (e) {
-    return 'AI javob bera olmadi. Qayta urinib ko\'ring.';
+  bot.on('polling_error', (err) => {
+    console.error('Polling xato:', err.message);
+    if (err.message.includes('409')) {
+      console.log('409 conflict - 10 soniya kutib qayta ulanamiz...');
+      setTimeout(() => {
+        bot.stopPolling().then(() => {
+          setTimeout(() => bot.startPolling(), 3000);
+        });
+      }, 10000);
+    }
+  });
+
+  function parseCSV(text) {
+    const lines = text.trim().split('\n');
+    if (lines.length < 2) return [];
+    const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+    return lines.slice(1).map(line => {
+      const values = line.split(',').map(v => v.trim().replace(/"/g, ''));
+      const row = {};
+      headers.forEach((h, i) => { row[h] = values[i] || ''; });
+      return row;
+    }).filter(r => r['Ismi'] || r['1-Tel nomer']);
   }
-}
 
-// System prompt builder
-function buildSystemPrompt(data) {
-  const zs = calcStats(data.zebo);
-  const ns = calcStats(data.noizma);
+  async function fetchSheet(key) {
+    try {
+      const url = `https://docs.google.com/spreadsheets/d/${key === 'zebo' ? '1dEE5NipUffWAE0rzrF26bhKOKP4KTtE_LZlyhusy8yU' : '17tPwSgr-jQKut2Gfznd7EsqW-0SVUBX3AdCZO6BdlnE'}/export?format=csv`;
+      const res = await axios.get(url, { timeout: 15000 });
+      return parseCSV(res.data);
+    } catch(e) {
+      console.error('Sheet o\'qish xatosi:', e.message);
+      return null;
+    }
+  }
 
-  return `Sen professional CRM va sales tahlilchisisisan. Siz O'zbekistonda qurilish materiallari (penoplex, bazalt, minvata) sotadigan kompaniyaning community manager assistentisiz.
+  async function fetchAll() {
+    const [zebo, noizma] = await Promise.all([fetchSheet('zebo'), fetchSheet('noizma')]);
+    return { zebo, noizma };
+  }
 
-HOZIRGI MA'LUMOTLAR (Google Sheets dan real vaqtda):
+  function calcStats(rows) {
+    if (!rows) return null;
+    const total = rows.length;
+    const boglan = rows.filter(r => r["Bog'lanldimi?"] === 'Haa').length;
+    const sifatli = rows.filter(r => r['Lead sifati'] === 'Sifatli').length;
+    const sifatsiz = rows.filter(r => r['Lead sifati'] === 'Sifatsiz').length;
+    const telOlmadi = rows.filter(r => (r['Izoh'] || '').toLowerCase().includes('tel omadi')).length;
+    const qimmat = rows.filter(r => (r['Holati'] || '').toLowerCase().includes('qimmat')).length;
+    const qaytaKerak = rows.filter(r => {
+      const v = r["Qayta aloqa\n keremi?"] || r["Qayta aloqa keremi?"] || '';
+      return v === 'Kerak';
+    }).length;
+    return { total, boglan, sifatli, sifatsiz, telOlmadi, qimmat, qaytaKerak };
+  }
 
-=== ZEBO (Manager) ===
-Jami leadlar: ${zs?.total || 0}
+  async function askClaude(system, user) {
+    try {
+      const res = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1500,
+        system,
+        messages: [{ role: 'user', content: user }]
+      }, {
+        headers: {
+          'x-api-key': ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json'
+        },
+        timeout: 30000
+      });
+      return res.data.content[0].text;
+    } catch(e) {
+      console.error('Claude xato:', e.response?.data || e.message);
+      return null;
+    }
+  }
+
+  function buildSystem(data) {
+    const zs = calcStats(data.zebo);
+    const ns = calcStats(data.noizma);
+    return `Sen professional CRM va sales tahlilchisisisan. O'zbekistonda qurilish materiallari (penoplex, bazalt, minvata) sotadigan kompaniyaning community manager assistentisan.
+
+ZEBO MA'LUMOTLARI:
+Jami: ${zs?.total || 0} lead
 Bog'langan: ${zs?.boglan || 0} (${zs ? Math.round(zs.boglan/zs.total*100) : 0}%)
 Sifatli: ${zs?.sifatli || 0} | Sifatsiz: ${zs?.sifatsiz || 0}
 Qayta aloqa kerak: ${zs?.qaytaKerak || 0}
 Tel ko'tarmadi: ${zs?.telOlmadi || 0}
-"Qimmat" e'tirozi: ${zs?.qimmat || 0}
-Mahsulot qiziqishi: ${JSON.stringify(zs?.products || {})}
+Narx e'tirozi: ${zs?.qimmat || 0}
+Leadlar: ${JSON.stringify(data.zebo?.slice(0,20) || [])}
 
-RAW LEADLAR (Zebo):
-${JSON.stringify(data.zebo?.slice(0, 30) || [])}
-
-=== NOIZMA (Manager) ===
-Jami leadlar: ${ns?.total || 0}
+NOIZMA MA'LUMOTLARI:
+Jami: ${ns?.total || 0} lead
 Bog'langan: ${ns?.boglan || 0} (${ns ? Math.round(ns.boglan/ns.total*100) : 0}%)
 Sifatli: ${ns?.sifatli || 0} | Sifatsiz: ${ns?.sifatsiz || 0}
 Qayta aloqa kerak: ${ns?.qaytaKerak || 0}
 Tel ko'tarmadi: ${ns?.telOlmadi || 0}
-"Qimmat" e'tirozi: ${ns?.qimmat || 0}
-Mahsulot qiziqishi: ${JSON.stringify(ns?.products || {})}
+Narx e'tirozi: ${ns?.qimmat || 0}
+Leadlar: ${JSON.stringify(data.noizma?.slice(0,20) || [])}
 
-RAW LEADLAR (Noizma):
-${JSON.stringify(data.noizma?.slice(0, 30) || [])}
+O'zbek tilida javob ber. Qisqa, aniq, professional. Telegram format (*bold*, _italic_). Raqamlarga asoslan.`;
+  }
 
-QOIDALAR:
-- O'zbek tilida javob ber
-- Qisqa, aniq, professional bo'l
-- Raqamlar va faktlarga asoslan
-- Telegram formatida yoz (bold uchun *matn*, italic uchun _matn_)
-- Zarur bo'lsa emoji ishlat
-- Tavsiyalar konkret va amaliy bo'lsin`;
+  bot.onText(/\/start/, msg => {
+    bot.sendMessage(msg.chat.id,
+      `👋 Assalomu alaykum, *${msg.from.first_name}*!\n\nMen sizning *Community Manager AI Assistentingizman*.\n\n📊 /hisobot — Kunlik to'liq tahlil\n👤 /zebo — Zebo tahlili\n👤 /noizma — Noizma tahlili\n🔄 /yangilash — Statistika\n\nYoki istalgan savol bering!`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  bot.onText(/\/hisobot/, async msg => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, '⏳ Sheets o\'qilmoqda...');
+    const data = await fetchAll();
+    if (!data.zebo && !data.noizma) return bot.sendMessage(chatId, '❌ Sheets o\'qib bo\'lmadi.');
+    const answer = await askClaude(buildSystem(data), 'Zebo va Noizmaning bugungi kunlik to\'liq professional hisobotini ber. Har biri uchun: nechta lead, sifatli foizi, nima qildi, nima qilmadi, ball (10 dan). Oxirida umumiy xulosa.');
+    if (!answer) return bot.sendMessage(chatId, '❌ AI javob bera olmadi. ANTHROPIC_API_KEY ni tekshiring.');
+    bot.sendMessage(chatId, answer, { parse_mode: 'Markdown' });
+  });
+
+  bot.onText(/\/zebo/, async msg => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, '⏳ Zebo ma\'lumotlari o\'qilmoqda...');
+    const data = await fetchAll();
+    const answer = await askClaude(buildSystem(data), 'Faqat ZEBO haqida batafsil professional tahlil ber. Kuchli tomonlari, zaif tomonlari, konkret misollar, tavsiyalar va ball.');
+    if (!answer) return bot.sendMessage(chatId, '❌ AI javob bera olmadi.');
+    bot.sendMessage(chatId, answer, { parse_mode: 'Markdown' });
+  });
+
+  bot.onText(/\/noizma/, async msg => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, '⏳ Noizma ma\'lumotlari o\'qilmoqda...');
+    const data = await fetchAll();
+    const answer = await askClaude(buildSystem(data), 'Faqat NOIZMA haqida batafsil professional tahlil ber. Kuchli tomonlari, zaif tomonlari, konkret misollar, tavsiyalar va ball.');
+    if (!answer) return bot.sendMessage(chatId, '❌ AI javob bera olmadi.');
+    bot.sendMessage(chatId, answer, { parse_mode: 'Markdown' });
+  });
+
+  bot.onText(/\/yangilash/, async msg => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, '🔄 Yangilanmoqda...');
+    const data = await fetchAll();
+    const zs = calcStats(data.zebo);
+    const ns = calcStats(data.noizma);
+    bot.sendMessage(chatId,
+      `✅ *Yangilandi!*\n\n*Zebo:* ${zs?.total || 0} lead (${zs?.sifatli || 0} sifatli)\n*Noizma:* ${ns?.total || 0} lead (${ns?.sifatli || 0} sifatli)\n\nJami: *${(zs?.total||0)+(ns?.total||0)} lead*`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  bot.on('message', async msg => {
+    if (msg.text && msg.text.startsWith('/')) return;
+    const chatId = msg.chat.id;
+    if (!msg.text) return;
+    bot.sendChatAction(chatId, 'typing');
+    const data = await fetchAll();
+    const answer = await askClaude(buildSystem(data), msg.text);
+    if (!answer) return bot.sendMessage(chatId, '❌ AI javob bera olmadi. Qayta urinib ko\'ring.');
+    bot.sendMessage(chatId, answer, { parse_mode: 'Markdown' });
+  });
+
+  console.log('🤖 Community Manager Bot ishga tushdi!');
 }
 
-// Komandalar
-bot.onText(/\/start/, async (msg) => {
-  const name = msg.from.first_name || 'Boss';
-  bot.sendMessage(msg.chat.id,
-    `👋 Assalomu alaykum, *${name}*!\n\nMen sizning *Community Manager AI Assistentingizman*.\n\nNima qila olaman:\n📊 /hisobot — Kunlik to'liq tahlil\n👤 /zebo — Zebo tahlili\n👤 /noizma — Noizma tahlili\n🔄 /yangilash — Sheets yangilash\n\nYoki menga istalgan savol bering:\n_"Bugun nechta lead tushdi?"_\n_"Qaysi leadlarni qayta qo'ng'iroq kerak?"_\n_"Zebo yoki Noizma yaxshiroq ishladi?"_`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-bot.onText(/\/hisobot/, async (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, '⏳ Sheets o\'qilmoqda, tahlil qilinmoqda...');
-
-  const data = await fetchAllSheets();
-  if (!data.zebo && !data.noizma) {
-    return bot.sendMessage(chatId, '❌ Sheets o\'qib bo\'lmadi. Sheets public ekanligini tekshiring.');
-  }
-
-  const systemPrompt = buildSystemPrompt(data);
-  const answer = await askClaude(systemPrompt,
-    'Menga bugungi kunlik to\'liq hisobotni ber. Har bir manager (Zebo va Noizma) uchun: nechta lead, nechta sifatli, nima qildi, nima qilmadi, tavsiyalar. Oxirida umumiy xulosa va eng muhim 1 ta masala.'
-  );
-
-  bot.sendMessage(chatId, answer, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/zebo/, async (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, '⏳ Zebo sheets o\'qilmoqda...');
-
-  const data = await fetchAllSheets();
-  const systemPrompt = buildSystemPrompt(data);
-  const answer = await askClaude(systemPrompt,
-    'Faqat ZEBO haqida batafsil tahlil ber. Uning kuchli va zaif tomonlari, konkret misollar bilan.'
-  );
-  bot.sendMessage(chatId, answer, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/noizma/, async (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, '⏳ Noizma sheets o\'qilmoqda...');
-
-  const data = await fetchAllSheets();
-  const systemPrompt = buildSystemPrompt(data);
-  const answer = await askClaude(systemPrompt,
-    'Faqat NOIZMA haqida batafsil tahlil ber. Uning kuchli va zaif tomonlari, konkret misollar bilan.'
-  );
-  bot.sendMessage(chatId, answer, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/yangilash/, async (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, '🔄 Sheets yangilanmoqda...');
-  const data = await fetchAllSheets();
-  const zs = calcStats(data.zebo);
-  const ns = calcStats(data.noizma);
-  bot.sendMessage(chatId,
-    `✅ *Yangilandi!*\n\n*Zebo:* ${zs?.total || 0} lead (${zs?.sifatli || 0} sifatli)\n*Noizma:* ${ns?.total || 0} lead (${ns?.sifatli || 0} sifatli)\n\nJami: *${(zs?.total||0)+(ns?.total||0)} lead*`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-// Oddiy xabar — AI javob
-bot.on('message', async (msg) => {
-  if (msg.text && msg.text.startsWith('/')) return;
-  const chatId = msg.chat.id;
-  const userText = msg.text;
-  if (!userText) return;
-
-  bot.sendChatAction(chatId, 'typing');
-
-  const data = await fetchAllSheets();
-  if (!data.zebo && !data.noizma) {
-    return bot.sendMessage(chatId, '❌ Sheets o\'qib bo\'lmadi.');
-  }
-
-  const systemPrompt = buildSystemPrompt(data);
-  const answer = await askClaude(systemPrompt, userText);
-  bot.sendMessage(chatId, answer, { parse_mode: 'Markdown' });
-});
-
-console.log('🤖 Community Manager Bot ishga tushdi!');
-console.log('Komandalar: /hisobot /zebo /noizma /yangilash');
+clearAndStart();
